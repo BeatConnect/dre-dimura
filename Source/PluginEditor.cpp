@@ -1,3 +1,13 @@
+/*
+  ==============================================================================
+    Dre-Dimura - Plugin Editor Implementation
+    Vintage preamp coloration utility
+
+    Uses JUCE 8's native WebView relay system for reliable bidirectional
+    parameter synchronization between C++ and the web UI.
+  ==============================================================================
+*/
+
 #include "PluginEditor.h"
 #include "ParameterIDs.h"
 
@@ -5,13 +15,16 @@
 #include <beatconnect/Activation.h>
 #endif
 
+static constexpr const char* DEV_SERVER_URL = "http://localhost:5173";
+
+//==============================================================================
 DreDimuraEditor::DreDimuraEditor(DreDimuraProcessor& p)
     : AudioProcessorEditor(&p), processorRef(p)
 {
     // Create relays BEFORE WebView (required by JUCE 8 relay system)
     setupRelays();
 
-    // Create WebView
+    // Create WebView with full configuration
     setupWebView();
 
     // Create attachments AFTER WebView
@@ -34,6 +47,7 @@ DreDimuraEditor::~DreDimuraEditor()
 {
 }
 
+//==============================================================================
 void DreDimuraEditor::setupRelays()
 {
     // Relay names MUST match parameter IDs exactly
@@ -43,20 +57,74 @@ void DreDimuraEditor::setupRelays()
     bypassRelay = std::make_unique<juce::WebToggleButtonRelay>(ParameterIDs::bypass);
 }
 
+//==============================================================================
 void DreDimuraEditor::setupWebView()
 {
-    juce::WebBrowserComponent::Options options;
+    // ===========================================================================
+    // STEP 1: Get resources directory - handle both Standalone and VST3 paths
+    // ===========================================================================
+    auto executableFile = juce::File::getSpecialLocation(juce::File::currentExecutableFile);
+    auto executableDir = executableFile.getParentDirectory();
 
-    // Add relay options
-    options = options
+    // Try Standalone path first: executable/../Resources/WebUI
+    resourcesDir = executableDir.getChildFile("Resources").getChildFile("WebUI");
+
+    // If that doesn't exist, try VST3 path: executable/../../Resources/WebUI
+    // VST3 structure: Plugin.vst3/Contents/x86_64-win/Plugin.vst3 (DLL)
+    //                 Plugin.vst3/Contents/Resources/WebUI
+    if (!resourcesDir.isDirectory())
+    {
+        resourcesDir = executableDir.getParentDirectory()
+                           .getChildFile("Resources")
+                           .getChildFile("WebUI");
+    }
+
+    // ===========================================================================
+    // STEP 2: Build WebBrowserComponent with JUCE 8 options
+    // ===========================================================================
+    auto options = juce::WebBrowserComponent::Options()
+        .withBackend(juce::WebBrowserComponent::Options::Backend::webview2)
+        .withNativeIntegrationEnabled()
+        .withResourceProvider(
+            [this](const juce::String& url) -> std::optional<juce::WebBrowserComponent::Resource>
+            {
+                auto path = url;
+                if (path.startsWith("/"))
+                    path = path.substring(1);
+                if (path.isEmpty())
+                    path = "index.html";
+
+                auto file = resourcesDir.getChildFile(path);
+                if (!file.existsAsFile())
+                    return std::nullopt;
+
+                juce::String mimeType = "application/octet-stream";
+                if (path.endsWith(".html")) mimeType = "text/html";
+                else if (path.endsWith(".css")) mimeType = "text/css";
+                else if (path.endsWith(".js")) mimeType = "application/javascript";
+                else if (path.endsWith(".json")) mimeType = "application/json";
+                else if (path.endsWith(".png")) mimeType = "image/png";
+                else if (path.endsWith(".jpg") || path.endsWith(".jpeg")) mimeType = "image/jpeg";
+                else if (path.endsWith(".svg")) mimeType = "image/svg+xml";
+                else if (path.endsWith(".woff")) mimeType = "font/woff";
+                else if (path.endsWith(".woff2")) mimeType = "font/woff2";
+
+                juce::MemoryBlock data;
+                file.loadFileAsData(data);
+
+                return juce::WebBrowserComponent::Resource{
+                    std::vector<std::byte>(
+                        reinterpret_cast<const std::byte*>(data.getData()),
+                        reinterpret_cast<const std::byte*>(data.getData()) + data.getSize()),
+                    mimeType.toStdString()
+                };
+            })
+        // Register all relays
         .withOptionsFrom(*driveRelay)
         .withOptionsFrom(*toneRelay)
         .withOptionsFrom(*outputRelay)
-        .withOptionsFrom(*bypassRelay);
-
-#if BEATCONNECT_ACTIVATION_ENABLED
-    // Activation event listeners
-    options = options
+        .withOptionsFrom(*bypassRelay)
+        // Activation event listeners
         .withEventListener("activateLicense", [this](const juce::var& data) {
             handleActivateLicense(data);
         })
@@ -65,95 +133,176 @@ void DreDimuraEditor::setupWebView()
         })
         .withEventListener("getActivationStatus", [this](const juce::var&) {
             handleGetActivationStatus();
-        });
-#endif
+        })
+        .withWinWebView2Options(
+            juce::WebBrowserComponent::Options::WinWebView2()
+                .withBackgroundColour(juce::Colour(0xff1a1a2e))
+                .withStatusBarDisabled()
+                .withUserDataFolder(
+                    juce::File::getSpecialLocation(juce::File::tempDirectory)
+                        .getChildFile("DreDimura_WebView2")));
 
-    // Create WebView with options
     webView = std::make_unique<juce::WebBrowserComponent>(options);
     addAndMakeVisible(*webView);
 
-    // Load UI based on build mode
+    // ===========================================================================
+    // STEP 3: Load URL based on build mode
+    // ===========================================================================
 #if DRE_DIMURA_DEV_MODE
-    // Development: hot reload from Vite dev server
-    webView->goToURL("http://localhost:5173");
-#elif HAS_WEB_ASSETS
-    // Production: load from bundled assets
-    webView->goToURL(juce::WebBrowserComponent::getResourceProviderRoot());
+    webView->goToURL(DEV_SERVER_URL);
 #else
-    // Fallback: show placeholder
-    webView->goToURL("about:blank");
+    webView->goToURL(webView->getResourceProviderRoot());
 #endif
 }
 
-#if BEATCONNECT_ACTIVATION_ENABLED
+//==============================================================================
+// Activation Handlers
+//==============================================================================
+
 void DreDimuraEditor::sendActivationState()
 {
-    auto& activation = beatconnect::Activation::getInstance();
-    juce::DynamicObject::Ptr data = new juce::DynamicObject();
-    data->setProperty("isConfigured", activation.isConfigured());
-    data->setProperty("isActivated", activation.isActivated());
+    if (!webView)
+        return;
 
-    if (activation.isActivated())
+    juce::DynamicObject::Ptr data = new juce::DynamicObject();
+
+#if BEATCONNECT_ACTIVATION_ENABLED
+    auto* activation = processorRef.getActivation();
+
+    bool isConfigured = activation != nullptr;
+    bool isActivated = activation && activation->isActivated();
+
+    data->setProperty("isConfigured", isConfigured);
+    data->setProperty("isActivated", isActivated);
+
+    if (isActivated && activation)
     {
-        auto info = activation.getActivationInfo();
-        juce::DynamicObject::Ptr infoObj = new juce::DynamicObject();
-        infoObj->setProperty("activationCode", juce::String(info.activationCode));
-        infoObj->setProperty("machineId", juce::String(info.machineId));
-        infoObj->setProperty("activatedAt", juce::String(info.activatedAt));
-        infoObj->setProperty("currentActivations", info.currentActivations);
-        infoObj->setProperty("maxActivations", info.maxActivations);
-        infoObj->setProperty("isValid", info.isValid);
-        data->setProperty("info", juce::var(infoObj.get()));
+        if (auto info = activation->getActivationInfo())
+        {
+            juce::DynamicObject::Ptr infoObj = new juce::DynamicObject();
+            infoObj->setProperty("activationCode", juce::String(info->activationCode));
+            infoObj->setProperty("machineId", juce::String(info->machineId));
+            infoObj->setProperty("activatedAt", juce::String(info->activatedAt));
+            infoObj->setProperty("currentActivations", info->currentActivations);
+            infoObj->setProperty("maxActivations", info->maxActivations);
+            infoObj->setProperty("isValid", info->isValid);
+            data->setProperty("info", juce::var(infoObj.get()));
+        }
     }
+#else
+    // Activation not enabled - report as not configured (no dialog shown)
+    data->setProperty("isConfigured", false);
+    data->setProperty("isActivated", true);  // Allow full access when activation disabled
+#endif
 
     webView->emitEventIfBrowserIsVisible("activationState", juce::var(data.get()));
 }
 
 void DreDimuraEditor::handleActivateLicense(const juce::var& data)
 {
-    auto code = data.getProperty("code", "").toString().toStdString();
+#if BEATCONNECT_ACTIVATION_ENABLED
+    juce::String code = data.getProperty("code", "").toString();
+    if (code.isEmpty())
+        return;
 
-    beatconnect::Activation::getInstance().activate(code,
-        [this](beatconnect::ActivationStatus status, const beatconnect::ActivationInfo& info) {
-            juce::MessageManager::callAsync([this, status, info]() {
+    // Use weak reference for async callback safety
+    juce::Component::SafePointer<DreDimuraEditor> safeThis(this);
+
+    auto* activation = processorRef.getActivation();
+    if (!activation) return;
+
+    activation->activateAsync(code.toStdString(),
+        [safeThis](beatconnect::ActivationStatus status) {
+            juce::MessageManager::callAsync([safeThis, status]() {
+                if (!safeThis)
+                    return;
+
                 juce::DynamicObject::Ptr result = new juce::DynamicObject();
-                result->setProperty("status", juce::String(beatconnect::statusToString(status)));
 
-                if (status == beatconnect::ActivationStatus::Valid)
+                juce::String statusStr;
+                switch (status)
                 {
-                    juce::DynamicObject::Ptr infoObj = new juce::DynamicObject();
-                    infoObj->setProperty("activationCode", juce::String(info.activationCode));
-                    infoObj->setProperty("machineId", juce::String(info.machineId));
-                    infoObj->setProperty("activatedAt", juce::String(info.activatedAt));
-                    infoObj->setProperty("currentActivations", info.currentActivations);
-                    infoObj->setProperty("maxActivations", info.maxActivations);
-                    infoObj->setProperty("isValid", info.isValid);
-                    result->setProperty("info", juce::var(infoObj.get()));
+                    case beatconnect::ActivationStatus::Valid:         statusStr = "valid"; break;
+                    case beatconnect::ActivationStatus::Invalid:       statusStr = "invalid"; break;
+                    case beatconnect::ActivationStatus::Revoked:       statusStr = "revoked"; break;
+                    case beatconnect::ActivationStatus::MaxReached:    statusStr = "max_reached"; break;
+                    case beatconnect::ActivationStatus::NetworkError:  statusStr = "network_error"; break;
+                    case beatconnect::ActivationStatus::ServerError:   statusStr = "server_error"; break;
+                    case beatconnect::ActivationStatus::NotConfigured: statusStr = "not_configured"; break;
+                    case beatconnect::ActivationStatus::AlreadyActive: statusStr = "already_active"; break;
+                    case beatconnect::ActivationStatus::NotActivated:  statusStr = "not_activated"; break;
+                    default: statusStr = "unknown"; break;
+                }
+                result->setProperty("status", statusStr);
+
+                // If successful, include activation info
+                if (status == beatconnect::ActivationStatus::Valid ||
+                    status == beatconnect::ActivationStatus::AlreadyActive)
+                {
+                    auto* activation = safeThis->processorRef.getActivation();
+                    if (activation)
+                    {
+                        if (auto info = activation->getActivationInfo())
+                        {
+                            juce::DynamicObject::Ptr infoObj = new juce::DynamicObject();
+                            infoObj->setProperty("activationCode", juce::String(info->activationCode));
+                            infoObj->setProperty("machineId", juce::String(info->machineId));
+                            infoObj->setProperty("activatedAt", juce::String(info->activatedAt));
+                            infoObj->setProperty("currentActivations", info->currentActivations);
+                            infoObj->setProperty("maxActivations", info->maxActivations);
+                            infoObj->setProperty("isValid", info->isValid);
+                            result->setProperty("info", juce::var(infoObj.get()));
+                        }
+                    }
                 }
 
-                webView->emitEventIfBrowserIsVisible("activationResult", juce::var(result.get()));
+                safeThis->webView->emitEventIfBrowserIsVisible("activationResult", juce::var(result.get()));
             });
         });
+#else
+    juce::ignoreUnused(data);
+#endif
 }
 
-void DreDimuraEditor::handleDeactivateLicense(const juce::var&)
+void DreDimuraEditor::handleDeactivateLicense([[maybe_unused]] const juce::var& data)
 {
-    beatconnect::Activation::getInstance().deactivate(
-        [this](beatconnect::ActivationStatus status) {
-            juce::MessageManager::callAsync([this, status]() {
-                juce::DynamicObject::Ptr result = new juce::DynamicObject();
-                result->setProperty("status", juce::String(beatconnect::statusToString(status)));
-                webView->emitEventIfBrowserIsVisible("deactivationResult", juce::var(result.get()));
-            });
+#if BEATCONNECT_ACTIVATION_ENABLED
+    juce::Component::SafePointer<DreDimuraEditor> safeThis(this);
+
+    auto* activation = processorRef.getActivation();
+    if (!activation) return;
+
+    std::thread([safeThis, activation]() {
+        auto status = activation->deactivate();
+
+        juce::MessageManager::callAsync([safeThis, status]() {
+            if (!safeThis)
+                return;
+
+            juce::DynamicObject::Ptr result = new juce::DynamicObject();
+            juce::String statusStr;
+            switch (status)
+            {
+                case beatconnect::ActivationStatus::Valid:         statusStr = "valid"; break;
+                case beatconnect::ActivationStatus::NetworkError:  statusStr = "network_error"; break;
+                case beatconnect::ActivationStatus::ServerError:   statusStr = "server_error"; break;
+                case beatconnect::ActivationStatus::NotActivated:  statusStr = "not_activated"; break;
+                default: statusStr = "unknown"; break;
+            }
+            result->setProperty("status", statusStr);
+
+            safeThis->webView->emitEventIfBrowserIsVisible("deactivationResult", juce::var(result.get()));
         });
+    }).detach();
+#endif
 }
 
 void DreDimuraEditor::handleGetActivationStatus()
 {
     sendActivationState();
 }
-#endif
 
+//==============================================================================
 void DreDimuraEditor::paint(juce::Graphics& g)
 {
     g.fillAll(juce::Colour(0xff1a1a2e));

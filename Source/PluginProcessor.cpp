@@ -1,10 +1,14 @@
+/*
+  ==============================================================================
+    Dre-Dimura - Audio Processor Implementation
+    Vintage preamp coloration utility
+  ==============================================================================
+*/
+
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-#if BEATCONNECT_ACTIVATION_ENABLED
-#include <beatconnect/Activation.h>
-#endif
-
+//==============================================================================
 DreDimuraProcessor::DreDimuraProcessor()
     : AudioProcessor(BusesProperties()
                      .withInput("Input", juce::AudioChannelSet::stereo(), true)
@@ -25,6 +29,7 @@ DreDimuraProcessor::~DreDimuraProcessor()
 {
 }
 
+//==============================================================================
 juce::AudioProcessorValueTreeState::ParameterLayout DreDimuraProcessor::createParameterLayout()
 {
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
@@ -78,6 +83,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout DreDimuraProcessor::createPa
     return { params.begin(), params.end() };
 }
 
+//==============================================================================
 void DreDimuraProcessor::loadProjectData()
 {
 #if HAS_PROJECT_DATA
@@ -102,11 +108,14 @@ void DreDimuraProcessor::loadProjectData()
 
     if (enableActivation && pluginId_.isNotEmpty())
     {
+        // Create instance-based activation (not singleton!)
+        activation_ = std::make_unique<beatconnect::Activation>();
+
         beatconnect::ActivationConfig config;
         config.apiBaseUrl = apiBaseUrl_.toStdString();
         config.pluginId = pluginId_.toStdString();
         config.supabaseKey = supabasePublishableKey_.toStdString();
-        beatconnect::Activation::getInstance().configure(config);
+        activation_->configure(config);
     }
 #endif
 #endif
@@ -121,6 +130,7 @@ bool DreDimuraProcessor::hasActivationEnabled() const
 #endif
 }
 
+//==============================================================================
 const juce::String DreDimuraProcessor::getName() const
 {
     return JucePlugin_Name;
@@ -137,6 +147,7 @@ void DreDimuraProcessor::setCurrentProgram(int) {}
 const juce::String DreDimuraProcessor::getProgramName(int) { return {}; }
 void DreDimuraProcessor::changeProgramName(int, const juce::String&) {}
 
+//==============================================================================
 void DreDimuraProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
     // Prepare DSP with 2x headroom for variable buffer sizes
@@ -198,6 +209,7 @@ void DreDimuraProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     preampDSP.process(context);
 }
 
+//==============================================================================
 bool DreDimuraProcessor::hasEditor() const { return true; }
 
 juce::AudioProcessorEditor* DreDimuraProcessor::createEditor()
@@ -205,6 +217,7 @@ juce::AudioProcessorEditor* DreDimuraProcessor::createEditor()
     return new DreDimuraEditor(*this);
 }
 
+//==============================================================================
 void DreDimuraProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
@@ -232,6 +245,7 @@ void DreDimuraProcessor::setStateInformation(const void* data, int sizeInBytes)
     }
 }
 
+//==============================================================================
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new DreDimuraProcessor();
