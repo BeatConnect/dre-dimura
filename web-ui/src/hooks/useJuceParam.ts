@@ -10,6 +10,47 @@ import {
 } from '../lib/juce-bridge';
 
 // ==============================================================================
+// Batch Parameter Updates (for Preset Loading)
+// ==============================================================================
+
+interface BatchUpdate {
+  paramId: string;
+  value: number;
+}
+
+/**
+ * Apply multiple parameter updates with optional staggered timing for visual effect.
+ * Uses requestAnimationFrame for smooth transitions.
+ */
+export function applyBatchUpdates(
+  updates: BatchUpdate[],
+  options: { staggerMs?: number; onComplete?: () => void } = {}
+): void {
+  const { staggerMs = 0, onComplete } = options;
+
+  if (staggerMs === 0) {
+    // Apply all updates immediately
+    updates.forEach(({ paramId, value }) => {
+      const state = getSliderState(paramId);
+      state.setNormalisedValue(value);
+    });
+    onComplete?.();
+  } else {
+    // Stagger updates for visual effect
+    updates.forEach(({ paramId, value }, index) => {
+      setTimeout(() => {
+        const state = getSliderState(paramId);
+        state.setNormalisedValue(value);
+
+        if (index === updates.length - 1) {
+          onComplete?.();
+        }
+      }, index * staggerMs);
+    });
+  }
+}
+
+// ==============================================================================
 // useSliderParam - Continuous Float Parameters
 // ==============================================================================
 

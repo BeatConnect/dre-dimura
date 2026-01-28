@@ -1,11 +1,16 @@
-import React, { useState, useCallback } from 'react';
-import { useSliderParam, useToggleParam } from './hooks/useJuceParam';
+import React, { useState, useCallback, useEffect } from 'react';
+import { useSliderParam, useToggleParam, applyBatchUpdates } from './hooks/useJuceParam';
 import { useAudioLevels } from './hooks/useAudioLevels';
+import { useActivation } from './hooks/useActivation';
 import { Knob } from './components/Knob';
 import { EffectModule } from './components/EffectModule';
+import { PresetSelector } from './components/PresetSelector';
+import { PreampTooltipTrigger } from './components/PreampTooltip';
+import { ActivationScreen } from './components/ActivationScreen';
 import { HearthglowBackground } from './components/artwork/HearthglowBackground';
 import { NightfallBackground } from './components/artwork/NightfallBackground';
 import { SteelplateBackground } from './components/artwork/SteelplateBackground';
+import { Preset, getDefaultPresetForPreamp } from './data/presets';
 
 // Effect definitions per preamp
 const CATHODE_EFFECTS = [
@@ -665,18 +670,103 @@ function SteelPlateControls({ drive, tone, output, outputLevel }: {
 }
 
 function App() {
+  // Activation state - driven by useActivation hook (communicates with C++ backend)
+  const activation = useActivation();
+  // Once activation screen has been shown, track it so it stays mounted during animation
+  const [activationScreenShown, setActivationScreenShown] = useState(false);
+  // Track when to actually unmount the activation screen (after fade-out animation completes)
+  const [activationScreenRemoved, setActivationScreenRemoved] = useState(false);
+
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isTransitioning, setIsTransitioning] = useState(false);
   const [transitionDirection, setTransitionDirection] = useState<'left' | 'right'>('right');
   const [displayIndex, setDisplayIndex] = useState(0);
+  const [presetChanging, setPresetChanging] = useState(false);
 
+  // Track current preset per preamp
+  const [presets, setPresets] = useState<Record<string, Preset>>(() => ({
+    cathode: getDefaultPresetForPreamp('cathode'),
+    filament: getDefaultPresetForPreamp('filament'),
+    steelplate: getDefaultPresetForPreamp('steelplate'),
+  }));
+
+  // All hooks must be called before any conditional returns
   const drive = useSliderParam('drive', { defaultValue: 0.25 });
   const tone = useSliderParam('tone', { defaultValue: 0.5 });
   const output = useSliderParam('output', { defaultValue: 0.5 });
   const bypass = useToggleParam('bypass', { defaultValue: false });
   const audioLevels = useAudioLevels();
 
+  // Once C++ tells us activation is needed, mark it as shown so it stays mounted
+  useEffect(() => {
+    if (activation.showActivation && !activationScreenShown) {
+      setActivationScreenShown(true);
+    }
+  }, [activation.showActivation, activationScreenShown]);
+
+  // Handle activation animation complete - called by ActivationScreen when fade starts
+  const handleActivated = useCallback(() => {
+    // Delay unmounting to allow the CSS fade-out animation to complete
+    setTimeout(() => {
+      setActivationScreenRemoved(true);
+    }, 600);
+  }, []);
+
+  // Show activation screen if it was shown and hasn't been removed yet
+  const shouldShowActivation = activationScreenShown && !activationScreenRemoved;
+
   const currentPreamp = PREAMPS[displayIndex];
+  const currentPreset = presets[currentPreamp.id] || null;
+
+  // Get effect IDs for current preamp
+  const getEffectIds = useCallback((preampId: string): string[] => {
+    switch (preampId) {
+      case 'cathode':
+        return CATHODE_EFFECTS.map(e => e.id);
+      case 'filament':
+        return FILAMENT_EFFECTS.map(e => e.id);
+      case 'steelplate':
+        return STEELPLATE_EFFECTS.map(e => e.id);
+      default:
+        return [];
+    }
+  }, []);
+
+  // Handle preset change with smooth parameter animation
+  const handlePresetChange = useCallback((preset: Preset) => {
+    setPresetChanging(true);
+
+    // Update preset state
+    setPresets(prev => ({
+      ...prev,
+      [preset.preamp]: preset
+    }));
+
+    // Build batch updates for all parameters
+    const effectIds = getEffectIds(preset.preamp);
+    const updates = [
+      { paramId: 'drive', value: preset.values.drive },
+      { paramId: 'tone', value: preset.values.tone },
+      { paramId: 'output', value: preset.values.output },
+      ...preset.values.effects.map((value, index) => ({
+        paramId: effectIds[index],
+        value
+      }))
+    ];
+
+    // Update local state immediately for smooth UI
+    drive.setValue(preset.values.drive);
+    tone.setValue(preset.values.tone);
+    output.setValue(preset.values.output);
+
+    // Apply batch updates to JUCE with slight stagger for visual effect
+    applyBatchUpdates(updates, {
+      staggerMs: 15,
+      onComplete: () => {
+        setTimeout(() => setPresetChanging(false), 100);
+      }
+    });
+  }, [drive, tone, output, getEffectIds]);
 
   // Use real audio levels from the processor (clamped to 0-1 range for display)
   const inputLevel = Math.min(1, audioLevels.inputLevel);
@@ -728,61 +818,84 @@ function App() {
   };
 
   return (
-    <div className={`plugin-container ${currentPreamp.theme} ${bypass.value ? 'bypassed' : ''}`}>
-      <div className={`plugin-background ${isTransitioning ? `transitioning-${transitionDirection}` : ''}`}>
-        {renderBackground()}
+    <>
+      {/* Main plugin UI - always rendered so it's visible behind the activation screen */}
+      <div className={`plugin-container ${currentPreamp.theme} ${bypass.value ? 'bypassed' : ''} ${shouldShowActivation ? 'behind-activation' : ''}`}>
+        <div className={`plugin-background ${isTransitioning ? `transitioning-${transitionDirection}` : ''}`}>
+          {renderBackground()}
+        </div>
+
+        <div className={`plugin-content ${isTransitioning ? `content-transitioning-${transitionDirection}` : ''} ${presetChanging ? 'preset-changing' : ''}`}>
+          <header className="plugin-header">
+            <PreampTooltipTrigger preampId={currentPreamp.id as 'cathode' | 'filament' | 'steelplate'}>
+              <div className="brand">
+                <h1 className="brand-name">{currentPreamp.name}</h1>
+                <span className="brand-subtitle">{currentPreamp.subtitle}</span>
+              </div>
+            </PreampTooltipTrigger>
+
+            <PresetSelector
+              preampId={currentPreamp.id as 'cathode' | 'filament' | 'steelplate'}
+              currentPreset={currentPreset}
+              onPresetChange={handlePresetChange}
+            />
+
+            <button
+              className={`bypass-toggle ${bypass.value ? 'bypassed' : 'active'}`}
+              onClick={bypass.toggle}
+            >
+              <div className="bypass-light" />
+              <span className="bypass-text">{bypass.value ? 'Off' : 'On'}</span>
+            </button>
+          </header>
+
+          <section className="controls-section">
+            <CarouselArrow
+              direction="left"
+              onClick={goPrev}
+              disabled={currentIndex === 0 || isTransitioning}
+            />
+
+            {renderControls()}
+
+            <CarouselArrow
+              direction="right"
+              onClick={goNext}
+              disabled={currentIndex === PREAMPS.length - 1 || isTransitioning}
+            />
+          </section>
+
+          <footer className="plugin-footer">
+            <span className="footer-text">Dre DiMura Audio</span>
+
+            <div className="carousel-indicators">
+              {PREAMPS.map((_, i) => (
+                <button
+                  key={i}
+                  className={`indicator ${i === currentIndex ? 'active' : ''}`}
+                  onClick={() => navigateTo(i)}
+                  disabled={isTransitioning}
+                />
+              ))}
+            </div>
+
+            <span className="footer-text">v1.0</span>
+          </footer>
+        </div>
       </div>
 
-      <div className={`plugin-content ${isTransitioning ? `content-transitioning-${transitionDirection}` : ''}`}>
-        <header className="plugin-header">
-          <div className="brand">
-            <h1 className="brand-name">{currentPreamp.name}</h1>
-            <span className="brand-subtitle">{currentPreamp.subtitle}</span>
-          </div>
-
-          <button
-            className={`bypass-toggle ${bypass.value ? 'bypassed' : 'active'}`}
-            onClick={bypass.toggle}
-          >
-            <div className="bypass-light" />
-            <span className="bypass-text">{bypass.value ? 'Off' : 'On'}</span>
-          </button>
-        </header>
-
-        <section className="controls-section">
-          <CarouselArrow
-            direction="left"
-            onClick={goPrev}
-            disabled={currentIndex === 0 || isTransitioning}
-          />
-
-          {renderControls()}
-
-          <CarouselArrow
-            direction="right"
-            onClick={goNext}
-            disabled={currentIndex === PREAMPS.length - 1 || isTransitioning}
-          />
-        </section>
-
-        <footer className="plugin-footer">
-          <span className="footer-text">Dre DiMura Audio</span>
-
-          <div className="carousel-indicators">
-            {PREAMPS.map((_, i) => (
-              <button
-                key={i}
-                className={`indicator ${i === currentIndex ? 'active' : ''}`}
-                onClick={() => navigateTo(i)}
-                disabled={isTransitioning}
-              />
-            ))}
-          </div>
-
-          <span className="footer-text">v1.0</span>
-        </footer>
-      </div>
-    </div>
+      {/* Activation screen overlay - rendered on top until animation completes */}
+      {shouldShowActivation && (
+        <ActivationScreen
+          onActivated={handleActivated}
+          isActivated={activation.isActivated}
+          isLoading={activation.isLoading}
+          lastError={activation.lastError}
+          onActivate={activation.activate}
+          onClearError={activation.clearError}
+        />
+      )}
+    </>
   );
 }
 
