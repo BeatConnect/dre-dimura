@@ -1,0 +1,478 @@
+# ==============================================================================
+# BeatConnect External Build Workflow
+# ==============================================================================
+# This workflow is triggered by BeatConnect when a build is requested.
+# It builds the plugin with BeatConnect SDK integration (activation, etc.)
+# and uploads unsigned artifacts to R2 for signing by BeatConnect's runners.
+#
+# Required secrets:
+#   - BUILDS_WEBHOOK_SECRET: Shared secret for authenticating with BeatConnect API
+# ==============================================================================
+
+name: BeatConnect Build
+
+on:
+  repository_dispatch:
+    types: [build-plugin]
+
+env:
+  CMAKE_VERSION: "3.28.1"
+  PLUGIN_NAME: "DreDimura"
+
+jobs:
+  # ==============================================================================
+  # Build Plugin (Windows)
+  # ==============================================================================
+  build-windows:
+    runs-on: bc-build-win
+    name: Build (Windows)
+
+    steps:
+      - name: Clean workspace
+        shell: powershell
+        run: |
+          if (Test-Path "${{ github.workspace }}/*") {
+            Remove-Item "${{ github.workspace }}/*" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.repo_full_name }}
+          ref: ${{ github.event.client_payload.ref || 'main' }}
+          token: ${{ secrets.GITHUB_PAT }}
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install and build web UI
+        shell: bash
+        run: |
+          if [ -d "web-ui" ]; then
+            cd web-ui && npm ci && npm run build
+          fi
+
+      - name: Set build variables
+        id: vars
+        shell: bash
+        run: |
+          echo "plugin_name=${{ github.event.client_payload.plugin_name || env.PLUGIN_NAME }}" >> $GITHUB_OUTPUT
+          echo "plugin_version=${{ github.event.client_payload.plugin_version || '1.0.0' }}" >> $GITHUB_OUTPUT
+          echo "build_id=${{ github.event.client_payload.build_id }}" >> $GITHUB_OUTPUT
+          echo "callback_url=${{ github.event.client_payload.callback_url }}" >> $GITHUB_OUTPUT
+
+      - name: Notify build running
+        if: steps.vars.outputs.callback_url != ''
+        shell: bash
+        run: |
+          curl -X POST "${{ steps.vars.outputs.callback_url }}" \
+            -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "status": "running",
+              "github_run_id": "${{ github.run_id }}",
+              "github_run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }' || echo "Failed to notify backend"
+
+      - name: Fetch project data
+        if: steps.vars.outputs.callback_url != ''
+        shell: bash
+        run: |
+          mkdir -p resources
+          CALLBACK_URL="${{ steps.vars.outputs.callback_url }}"
+          PROJECT_DATA_URL="${CALLBACK_URL%/status}/project-data"
+
+          RESPONSE=$(curl -s -X GET "$PROJECT_DATA_URL" \
+            -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}")
+
+          PROJECT_DATA=$(echo "$RESPONSE" | jq '.project_data')
+          FLAGS=$(echo "$RESPONSE" | jq '.flags // {}')
+
+          if [ "$FLAGS" != "{}" ] && [ "$FLAGS" != "null" ]; then
+            PROJECT_DATA=$(echo "$PROJECT_DATA" | jq --argjson flags "$FLAGS" '. + {flags: $flags}')
+          fi
+
+          echo "$PROJECT_DATA" > resources/project_data.json
+          echo "Project data saved"
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake -B build \
+            -G "Visual Studio 17 2022" -A x64 \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release --parallel
+
+      - name: Package and upload artifacts
+        if: steps.vars.outputs.callback_url != ''
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          PLUGIN_NAME="${{ steps.vars.outputs.plugin_name }}"
+          VERSION="${{ steps.vars.outputs.plugin_version }}"
+          CALLBACK_URL="${{ steps.vars.outputs.callback_url }}"
+          UPLOAD_URL_ENDPOINT="${CALLBACK_URL%/status}/upload-url"
+
+          ARTIFACTS_JSON="[]"
+
+          # Copy VST3
+          if [ -d "build/${PLUGIN_NAME}_artefacts/Release/VST3" ]; then
+            cp -r "build/${PLUGIN_NAME}_artefacts/Release/VST3/"*.vst3 artifacts/ || true
+          fi
+
+          # Upload each artifact
+          for file in artifacts/*; do
+            if [ -f "$file" ] || [ -d "$file" ]; then
+              FILE_NAME=$(basename "$file")
+
+              # Create zip for directories (VST3 bundles)
+              if [ -d "$file" ]; then
+                cd artifacts
+                powershell -Command "Compress-Archive -Path '$FILE_NAME' -DestinationPath '${FILE_NAME}.zip' -Force"
+                rm -rf "$FILE_NAME"
+                FILE_NAME="${FILE_NAME}.zip"
+                cd ..
+                file="artifacts/$FILE_NAME"
+              fi
+
+              FILE_SIZE=$(stat -c%s "$file" 2>/dev/null || wc -c < "$file" | tr -d ' ')
+              CHECKSUM=$(sha256sum "$file" | cut -d ' ' -f 1)
+
+              CONTENT_TYPE="application/octet-stream"
+              FORMAT="plugin"
+              if [[ "$FILE_NAME" == *.vst3.zip ]]; then
+                CONTENT_TYPE="application/zip"
+                FORMAT="vst3"
+              fi
+
+              echo "Uploading: $FILE_NAME (size: $FILE_SIZE, format: $FORMAT)"
+
+              RESPONSE=$(curl -s -X POST "$UPLOAD_URL_ENDPOINT" \
+                -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}" \
+                -H "Content-Type: application/json" \
+                -d "{\"file_name\": \"$FILE_NAME\", \"platform\": \"windows\", \"content_type\": \"$CONTENT_TYPE\"}")
+
+              UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url')
+              R2_KEY=$(echo "$RESPONSE" | jq -r '.r2_key')
+
+              if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
+                echo "Failed to get upload URL for $FILE_NAME"
+                continue
+              fi
+
+              curl --fail --silent --show-error \
+                -X PUT \
+                -H "Content-Type: $CONTENT_TYPE" \
+                --data-binary "@$file" \
+                "$UPLOAD_URL"
+
+              echo "Uploaded: $FILE_NAME to $R2_KEY"
+
+              ARTIFACT_JSON=$(echo '{}' | jq \
+                --arg platform "windows" \
+                --arg format "$FORMAT" \
+                --arg file_name "$FILE_NAME" \
+                --argjson file_size "$FILE_SIZE" \
+                --arg checksum "$CHECKSUM" \
+                --arg r2_key "$R2_KEY" \
+                --arg mime_type "$CONTENT_TYPE" \
+                '{
+                  platform: $platform,
+                  format: $format,
+                  architecture: "x64",
+                  file_name: $file_name,
+                  file_size: $file_size,
+                  checksum_sha256: $checksum,
+                  r2_key: $r2_key,
+                  mime_type: $mime_type,
+                  is_signed: false
+                }')
+
+              ARTIFACTS_JSON=$(echo "$ARTIFACTS_JSON" | jq --argjson artifact "$ARTIFACT_JSON" '. + [$artifact]')
+            fi
+          done
+
+          echo "$ARTIFACTS_JSON" > artifacts.json
+
+      - name: Register artifacts
+        if: steps.vars.outputs.callback_url != ''
+        shell: bash
+        run: |
+          CALLBACK_URL="${{ steps.vars.outputs.callback_url }}"
+          ARTIFACTS_URL="${CALLBACK_URL%/status}/artifacts"
+
+          if [ -f artifacts.json ]; then
+            ARTIFACTS_JSON=$(cat artifacts.json)
+            if [ "$ARTIFACTS_JSON" != "[]" ]; then
+              curl -X POST "$ARTIFACTS_URL" \
+                -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}" \
+                -H "Content-Type: application/json" \
+                -d "{\"artifacts\": $ARTIFACTS_JSON}" || echo "Failed to register artifacts"
+            fi
+          fi
+
+      - name: Notify build failure
+        if: failure() && steps.vars.outputs.callback_url != ''
+        shell: bash
+        run: |
+          curl -X POST "${{ steps.vars.outputs.callback_url }}" \
+            -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{"status": "failed", "error_message": "Windows build failed"}'
+
+  # ==============================================================================
+  # Build Plugin (macOS)
+  # ==============================================================================
+  build-macos:
+    runs-on: bc-build-mac
+    name: Build (macOS)
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.repo_full_name }}
+          ref: ${{ github.event.client_payload.ref || 'main' }}
+          token: ${{ secrets.GITHUB_PAT }}
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install and build web UI
+        run: |
+          if [ -d "web-ui" ]; then
+            cd web-ui && npm ci && npm run build
+          fi
+
+      - name: Set build variables
+        id: vars
+        run: |
+          echo "plugin_name=${{ github.event.client_payload.plugin_name || env.PLUGIN_NAME }}" >> $GITHUB_OUTPUT
+          echo "plugin_version=${{ github.event.client_payload.plugin_version || '1.0.0' }}" >> $GITHUB_OUTPUT
+          echo "build_id=${{ github.event.client_payload.build_id }}" >> $GITHUB_OUTPUT
+          echo "callback_url=${{ github.event.client_payload.callback_url }}" >> $GITHUB_OUTPUT
+
+      - name: Notify build running
+        if: steps.vars.outputs.callback_url != ''
+        run: |
+          curl -X POST "${{ steps.vars.outputs.callback_url }}" \
+            -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "status": "running",
+              "github_run_id": "${{ github.run_id }}",
+              "github_run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }' || echo "Failed to notify backend"
+
+      - name: Fetch project data
+        if: steps.vars.outputs.callback_url != ''
+        run: |
+          mkdir -p resources
+          CALLBACK_URL="${{ steps.vars.outputs.callback_url }}"
+          PROJECT_DATA_URL="${CALLBACK_URL%/status}/project-data"
+
+          echo "Fetching project data from: $PROJECT_DATA_URL"
+
+          RESPONSE=$(curl -s -X GET "$PROJECT_DATA_URL" \
+            -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}")
+
+          PROJECT_DATA=$(echo "$RESPONSE" | jq '.project_data')
+          FLAGS=$(echo "$RESPONSE" | jq '.flags // {}')
+
+          if [ "$FLAGS" != "{}" ] && [ "$FLAGS" != "null" ]; then
+            PROJECT_DATA=$(echo "$PROJECT_DATA" | jq --argjson flags "$FLAGS" '. + {flags: $flags}')
+            echo "Merged build flags into project_data"
+          fi
+
+          echo "$PROJECT_DATA" > resources/project_data.json
+
+          if [ ! -s resources/project_data.json ]; then
+            echo "Failed to fetch project data"
+            echo "Response was: $RESPONSE"
+            exit 1
+          fi
+
+          echo "Project data saved to resources/project_data.json"
+          cat resources/project_data.json | jq '.flags // "no flags"'
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: ${{ env.CMAKE_VERSION }}
+
+      - name: Check activation flag
+        id: flags
+        run: |
+          if [ -f resources/project_data.json ]; then
+            ENABLE_ACTIVATION=$(cat resources/project_data.json | jq -r '.flags.enableActivationKeys // false')
+            echo "enable_activation=$ENABLE_ACTIVATION" >> $GITHUB_OUTPUT
+          else
+            echo "enable_activation=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DBEATCONNECT_ENABLE_ACTIVATION=${{ steps.flags.outputs.enable_activation }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Package and upload artifacts
+        if: steps.vars.outputs.callback_url != ''
+        id: package
+        run: |
+          mkdir -p artifacts
+          PLUGIN_NAME="${{ steps.vars.outputs.plugin_name }}"
+          VERSION="${{ steps.vars.outputs.plugin_version }}"
+          CALLBACK_URL="${{ steps.vars.outputs.callback_url }}"
+          UPLOAD_URL_ENDPOINT="${CALLBACK_URL%/status}/upload-url"
+
+          ARTIFACTS_JSON="[]"
+
+          # Copy VST3 and AU
+          if [ -d "build/${PLUGIN_NAME}_artefacts/Release/VST3" ]; then
+            cp -r "build/${PLUGIN_NAME}_artefacts/Release/VST3/"*.vst3 artifacts/ || true
+          fi
+          if [ -d "build/${PLUGIN_NAME}_artefacts/Release/AU" ]; then
+            cp -r "build/${PLUGIN_NAME}_artefacts/Release/AU/"*.component artifacts/ || true
+          fi
+
+          # Upload each artifact
+          for item in artifacts/*; do
+            if [ -e "$item" ]; then
+              FILE_NAME=$(basename "$item")
+
+              # Zip directories (VST3/AU bundles)
+              if [ -d "$item" ]; then
+                cd artifacts
+                zip -r "${FILE_NAME}.zip" "$FILE_NAME"
+                rm -rf "$FILE_NAME"
+                FILE_NAME="${FILE_NAME}.zip"
+                cd ..
+                item="artifacts/$FILE_NAME"
+              fi
+
+              FILE_SIZE=$(stat -f%z "$item" 2>/dev/null || stat --printf="%s" "$item")
+              CHECKSUM=$(shasum -a 256 "$item" | cut -d ' ' -f 1)
+
+              CONTENT_TYPE="application/zip"
+              FORMAT="plugin"
+              if [[ "$FILE_NAME" == *.vst3.zip ]]; then
+                FORMAT="vst3"
+              elif [[ "$FILE_NAME" == *.component.zip ]]; then
+                FORMAT="au"
+              fi
+
+              echo "Uploading: $FILE_NAME (size: $FILE_SIZE, format: $FORMAT)"
+
+              RESPONSE=$(curl -s -X POST "$UPLOAD_URL_ENDPOINT" \
+                -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}" \
+                -H "Content-Type: application/json" \
+                -d "{\"file_name\": \"$FILE_NAME\", \"platform\": \"macos\", \"content_type\": \"$CONTENT_TYPE\"}")
+
+              UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url')
+              R2_KEY=$(echo "$RESPONSE" | jq -r '.r2_key')
+
+              if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
+                echo "Failed to get upload URL for $FILE_NAME"
+                continue
+              fi
+
+              curl --fail --silent --show-error \
+                -X PUT \
+                -H "Content-Type: $CONTENT_TYPE" \
+                --data-binary "@$item" \
+                "$UPLOAD_URL"
+
+              echo "Uploaded: $FILE_NAME to $R2_KEY"
+
+              ARTIFACT_JSON=$(jq -n \
+                --arg platform "macos" \
+                --arg format "$FORMAT" \
+                --arg file_name "$FILE_NAME" \
+                --argjson file_size "$FILE_SIZE" \
+                --arg checksum "$CHECKSUM" \
+                --arg r2_key "$R2_KEY" \
+                --arg mime_type "$CONTENT_TYPE" \
+                '{
+                  platform: $platform,
+                  format: $format,
+                  architecture: "universal",
+                  file_name: $file_name,
+                  file_size: $file_size,
+                  checksum_sha256: $checksum,
+                  r2_key: $r2_key,
+                  mime_type: $mime_type,
+                  is_signed: false
+                }')
+
+              ARTIFACTS_JSON=$(echo "$ARTIFACTS_JSON" | jq --argjson artifact "$ARTIFACT_JSON" '. + [$artifact]')
+            fi
+          done
+
+          echo "$ARTIFACTS_JSON" > artifacts.json
+
+      - name: Register artifacts
+        if: steps.vars.outputs.callback_url != ''
+        run: |
+          CALLBACK_URL="${{ steps.vars.outputs.callback_url }}"
+          ARTIFACTS_URL="${CALLBACK_URL%/status}/artifacts"
+
+          if [ -f artifacts.json ]; then
+            ARTIFACTS_JSON=$(cat artifacts.json)
+            if [ "$ARTIFACTS_JSON" != "[]" ]; then
+              curl -X POST "$ARTIFACTS_URL" \
+                -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}" \
+                -H "Content-Type: application/json" \
+                -d "{\"artifacts\": $ARTIFACTS_JSON}" || echo "Failed to register artifacts"
+            fi
+          fi
+
+      - name: Notify build failure
+        if: failure() && steps.vars.outputs.callback_url != ''
+        run: |
+          curl -X POST "${{ steps.vars.outputs.callback_url }}" \
+            -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "status": "failed",
+              "github_run_id": "${{ github.run_id }}",
+              "github_run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "error_message": "macOS build failed. Check GitHub Actions logs for details."
+            }' || echo "Failed to notify backend"
+
+  # ==============================================================================
+  # Notify Success
+  # ==============================================================================
+  notify-success:
+    needs: [build-windows, build-macos]
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get callback URL
+        id: vars
+        run: |
+          echo "callback_url=${{ github.event.client_payload.callback_url }}" >> $GITHUB_OUTPUT
+
+      - name: Notify backend
+        if: steps.vars.outputs.callback_url != ''
+        run: |
+          curl -X POST "${{ steps.vars.outputs.callback_url }}" \
+            -H "x-webhook-secret: ${{ secrets.BUILDS_WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "status": "signing_pending",
+              "github_run_id": "${{ github.run_id }}",
+              "github_run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "message": "Build complete, artifacts uploaded for signing"
+            }' || echo "Failed to notify backend"

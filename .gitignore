@@ -423,3 +423,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# BeatConnect build-time data (fetched during CI)
+resources/project_data.json
