@@ -4,18 +4,13 @@ namespace ParameterIDs
 {
     // Parameter identifiers - must match exactly in C++ and TypeScript
 
-    // Module selection (0=EP3, 1=RE201, 2=Schaffer, 3=Portastudio)
-    inline constexpr const char* module    = "module";
+    // Preamp type selection (0=Cathode, 1=Filament, 2=Steel Plate)
+    inline constexpr const char* preampType = "preampType";
 
-    // Core controls (shared across all modules)
+    // Core controls
     inline constexpr const char* drive     = "drive";
     inline constexpr const char* tone      = "tone";
     inline constexpr const char* output    = "output";
-
-    // Extended controls
-    inline constexpr const char* mix       = "mix";       // Wet/dry blend
-    inline constexpr const char* character = "character"; // Module-specific voicing
-    inline constexpr const char* warmth    = "warmth";    // Low-end presence
 
     // Bypass
     inline constexpr const char* bypass    = "bypass";

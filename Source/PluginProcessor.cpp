@@ -16,6 +16,7 @@ DreDimuraProcessor::DreDimuraProcessor()
       apvts(*this, nullptr, "Parameters", createParameterLayout())
 {
     // Cache parameter pointers for real-time access
+    preampTypeParam = apvts.getRawParameterValue(ParameterIDs::preampType);
     driveParam = apvts.getRawParameterValue(ParameterIDs::drive);
     toneParam = apvts.getRawParameterValue(ParameterIDs::tone);
     outputParam = apvts.getRawParameterValue(ParameterIDs::output);
@@ -54,6 +55,14 @@ DreDimuraProcessor::~DreDimuraProcessor()
 juce::AudioProcessorValueTreeState::ParameterLayout DreDimuraProcessor::createParameterLayout()
 {
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
+
+    // Preamp Type: 0=Cathode, 1=Filament, 2=Steel Plate
+    params.push_back(std::make_unique<juce::AudioParameterChoice>(
+        juce::ParameterID(ParameterIDs::preampType, ParameterIDs::kStateVersion),
+        "Preamp Type",
+        juce::StringArray{ "Cathode", "Filament", "Steel Plate" },
+        0  // Default to Cathode
+    ));
 
     // Drive: 0% to 100%, default 25%
     params.push_back(std::make_unique<juce::AudioParameterFloat>(
@@ -375,11 +384,13 @@ void DreDimuraProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
 
     // Update DSP parameters
+    int preampType = static_cast<int>(preampTypeParam->load());
+    preampDSP.setPreampType(preampType);
     preampDSP.setDrive(driveParam->load());
     preampDSP.setTone(toneParam->load());
     preampDSP.setOutputGain(outputParam->load());
 
-    // Update Cathode effect parameters
+    // Update Cathode effect parameters (only processed when Cathode is active)
     preampDSP.setCathEmber(cathEmberParam->load());
     preampDSP.setCathHaze(cathHazeParam->load());
     preampDSP.setCathEcho(cathEchoParam->load());

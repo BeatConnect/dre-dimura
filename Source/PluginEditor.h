@@ -40,6 +40,7 @@ private:
     std::unique_ptr<juce::WebSliderRelay> toneRelay;
     std::unique_ptr<juce::WebSliderRelay> outputRelay;
     std::unique_ptr<juce::WebToggleButtonRelay> bypassRelay;
+    std::unique_ptr<juce::WebComboBoxRelay> preampTypeRelay;
 
     // Cathode effect relays
     std::unique_ptr<juce::WebSliderRelay> cathEmberRelay;
@@ -68,6 +69,7 @@ private:
     std::unique_ptr<juce::WebSliderParameterAttachment> toneAttachment;
     std::unique_ptr<juce::WebSliderParameterAttachment> outputAttachment;
     std::unique_ptr<juce::WebToggleButtonParameterAttachment> bypassAttachment;
+    std::unique_ptr<juce::WebComboBoxParameterAttachment> preampTypeAttachment;
 
     // Cathode effect attachments
     std::unique_ptr<juce::WebSliderParameterAttachment> cathEmberAttachment;

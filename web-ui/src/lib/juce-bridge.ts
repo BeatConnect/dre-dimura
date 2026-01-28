@@ -277,11 +277,90 @@ export class ToggleState {
 }
 
 // ==============================================================================
+// ComboBoxState - Choice Parameter Control
+// ==============================================================================
+
+interface ComboBoxProperties {
+  name: string;
+  parameterIndex: number;
+  choices: string[];
+}
+
+/**
+ * ComboBoxState manages bidirectional sync with a WebComboBoxRelay on the C++ side.
+ * Used for AudioParameterChoice parameters (like preamp type selection).
+ */
+export class ComboBoxState {
+  readonly name: string;
+  private identifier: string;
+  private _index = 0;
+  private properties: ComboBoxProperties = {
+    name: '',
+    parameterIndex: -1,
+    choices: [],
+  };
+
+  valueChangedEvent = new ListenerList();
+  propertiesChangedEvent = new ListenerList();
+
+  constructor(name: string) {
+    this.name = name;
+    this.identifier = '__juce__comboBox' + name;
+
+    if (isInJuceWebView()) {
+      window.__JUCE__!.backend.addEventListener(this.identifier, (event) =>
+        this.handleEvent(event as Record<string, unknown>)
+      );
+
+      window.__JUCE__!.backend.emitEvent(this.identifier, {
+        eventType: 'requestInitialUpdate',
+      });
+    }
+  }
+
+  getIndex(): number {
+    return this._index;
+  }
+
+  setIndex(newIndex: number): void {
+    this._index = newIndex;
+
+    if (isInJuceWebView()) {
+      window.__JUCE__!.backend.emitEvent(this.identifier, {
+        eventType: BasicControl_valueChangedEventId,
+        value: this._index,
+      });
+    }
+  }
+
+  getChoices(): string[] {
+    return [...this.properties.choices];
+  }
+
+  getProperties(): ComboBoxProperties {
+    return { ...this.properties };
+  }
+
+  private handleEvent(event: Record<string, unknown>): void {
+    if (event.eventType === BasicControl_valueChangedEventId) {
+      this._index = event.value as number;
+      this.valueChangedEvent.callListeners();
+    }
+    if (event.eventType === BasicControl_propertiesChangedId) {
+      const { eventType: _, ...rest } = event;
+      this.properties = rest as unknown as ComboBoxProperties;
+      this.propertiesChangedEvent.callListeners();
+    }
+  }
+}
+
+// ==============================================================================
 // State Caches (Singleton pattern)
 // ==============================================================================
 
 const sliderStates = new Map<string, SliderState>();
 const toggleStates = new Map<string, ToggleState>();
+const comboStates = new Map<string, ComboBoxState>();
 
 /**
  * Get or create a SliderState for the given parameter name.
@@ -303,6 +382,17 @@ export function getToggleState(name: string): ToggleState {
     toggleStates.set(name, new ToggleState(name));
   }
   return toggleStates.get(name)!;
+}
+
+/**
+ * Get or create a ComboBoxState for the given parameter name.
+ * The name must match the identifier used in C++ WebComboBoxRelay("name").
+ */
+export function getComboState(name: string): ComboBoxState {
+  if (!comboStates.has(name)) {
+    comboStates.set(name, new ComboBoxState(name));
+  }
+  return comboStates.get(name)!;
 }
 
 // ==============================================================================

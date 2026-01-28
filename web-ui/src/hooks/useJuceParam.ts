@@ -6,6 +6,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   getSliderState,
   getToggleState,
+  getComboState,
   isInJuceWebView,
 } from '../lib/juce-bridge';
 
@@ -167,4 +168,59 @@ export function useToggleParam(
   }, []);
 
   return { value, setValue, toggle, isConnected };
+}
+
+// ==============================================================================
+// useComboParam - Choice/Selection Parameters (AudioParameterChoice)
+// ==============================================================================
+
+interface ComboParamOptions {
+  defaultIndex?: number;
+}
+
+interface ComboParamReturn {
+  index: number;
+  setIndex: (index: number) => void;
+  choices: string[];
+  isConnected: boolean;
+}
+
+export function useComboParam(
+  paramId: string,
+  options: ComboParamOptions = {}
+): ComboParamReturn {
+  const { defaultIndex = 0 } = options;
+  const [index, setIndexState] = useState(defaultIndex);
+  const [choices, setChoices] = useState<string[]>([]);
+  const stateRef = useRef(getComboState(paramId));
+  const isConnected = isInJuceWebView();
+
+  useEffect(() => {
+    const state = stateRef.current;
+
+    if (isConnected) {
+      setIndexState(state.getIndex());
+      setChoices(state.getChoices());
+    }
+
+    const valueListenerId = state.valueChangedEvent.addListener(() => {
+      setIndexState(state.getIndex());
+    });
+
+    const propsListenerId = state.propertiesChangedEvent.addListener(() => {
+      setChoices(state.getChoices());
+    });
+
+    return () => {
+      state.valueChangedEvent.removeListener(valueListenerId);
+      state.propertiesChangedEvent.removeListener(propsListenerId);
+    };
+  }, [isConnected]);
+
+  const setIndex = useCallback((newIndex: number) => {
+    setIndexState(newIndex);
+    stateRef.current.setIndex(newIndex);
+  }, []);
+
+  return { index, setIndex, choices, isConnected };
 }

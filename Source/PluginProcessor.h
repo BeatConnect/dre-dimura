@@ -94,6 +94,7 @@ private:
     juce::AudioProcessorValueTreeState apvts;
 
     // Parameter pointers for real-time access
+    std::atomic<float>* preampTypeParam = nullptr;
     std::atomic<float>* driveParam = nullptr;
     std::atomic<float>* toneParam = nullptr;
     std::atomic<float>* outputParam = nullptr;

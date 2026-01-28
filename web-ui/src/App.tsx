@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react';
-import { useSliderParam, useToggleParam, applyBatchUpdates } from './hooks/useJuceParam';
+import { useSliderParam, useToggleParam, useComboParam, applyBatchUpdates } from './hooks/useJuceParam';
 import { useAudioLevels } from './hooks/useAudioLevels';
 import { useActivation } from './hooks/useActivation';
 import { Knob } from './components/Knob';
@@ -691,11 +691,20 @@ function App() {
   }));
 
   // All hooks must be called before any conditional returns
+  const preampType = useComboParam('preampType', { defaultIndex: 0 });
   const drive = useSliderParam('drive', { defaultValue: 0.25 });
   const tone = useSliderParam('tone', { defaultValue: 0.5 });
   const output = useSliderParam('output', { defaultValue: 0.5 });
   const bypass = useToggleParam('bypass', { defaultValue: false });
   const audioLevels = useAudioLevels();
+
+  // Sync carousel with preampType parameter from C++
+  useEffect(() => {
+    if (preampType.index !== currentIndex && !isTransitioning) {
+      setCurrentIndex(preampType.index);
+      setDisplayIndex(preampType.index);
+    }
+  }, [preampType.index]);
 
   // Once C++ tells us activation is needed, mark it as shown so it stays mounted
   useEffect(() => {
@@ -780,6 +789,9 @@ function App() {
     setIsTransitioning(true);
     setCurrentIndex(newIndex);
 
+    // Sync preamp type to C++ backend
+    preampType.setIndex(newIndex);
+
     // Fast transition - swap content at midpoint
     setTimeout(() => {
       setDisplayIndex(newIndex);
@@ -789,7 +801,7 @@ function App() {
     setTimeout(() => {
       setIsTransitioning(false);
     }, 200);
-  }, [currentIndex, isTransitioning]);
+  }, [currentIndex, isTransitioning, preampType]);
 
   const goNext = () => navigateTo(currentIndex + 1);
   const goPrev = () => navigateTo(currentIndex - 1);

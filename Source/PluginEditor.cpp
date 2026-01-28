@@ -37,6 +37,8 @@ DreDimuraEditor::DreDimuraEditor(DreDimuraProcessor& p)
         *apvts.getParameter(ParameterIDs::output), *outputRelay, nullptr);
     bypassAttachment = std::make_unique<juce::WebToggleButtonParameterAttachment>(
         *apvts.getParameter(ParameterIDs::bypass), *bypassRelay, nullptr);
+    preampTypeAttachment = std::make_unique<juce::WebComboBoxParameterAttachment>(
+        *apvts.getParameter(ParameterIDs::preampType), *preampTypeRelay, nullptr);
 
     // Cathode effect attachments
     cathEmberAttachment = std::make_unique<juce::WebSliderParameterAttachment>(
@@ -95,6 +97,7 @@ void DreDimuraEditor::setupRelays()
     toneRelay = std::make_unique<juce::WebSliderRelay>(ParameterIDs::tone);
     outputRelay = std::make_unique<juce::WebSliderRelay>(ParameterIDs::output);
     bypassRelay = std::make_unique<juce::WebToggleButtonRelay>(ParameterIDs::bypass);
+    preampTypeRelay = std::make_unique<juce::WebComboBoxRelay>(ParameterIDs::preampType);
 
     // Cathode effect relays
     cathEmberRelay = std::make_unique<juce::WebSliderRelay>(ParameterIDs::cath_ember);
@@ -185,6 +188,7 @@ void DreDimuraEditor::setupWebView()
         .withOptionsFrom(*toneRelay)
         .withOptionsFrom(*outputRelay)
         .withOptionsFrom(*bypassRelay)
+        .withOptionsFrom(*preampTypeRelay)
         // Cathode effect relays
         .withOptionsFrom(*cathEmberRelay)
         .withOptionsFrom(*cathHazeRelay)
